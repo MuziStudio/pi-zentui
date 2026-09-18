@@ -137,20 +137,36 @@ export class AgentDurationClock {
 	}
 }
 
-function segmentGraphemes(value: string): Iterable<string> {
+// Creating an `Intl.Segmenter` per call is very expensive (ICU init). The working
+// line segments the same row for every animation frame, so reuse one instance.
+let sharedGraphemeSegmenter: Intl.Segmenter | undefined;
+let sharedGraphemeSegmenterResolved = false;
+
+function getSharedGraphemeSegmenter(): Intl.Segmenter | undefined {
+	if (sharedGraphemeSegmenterResolved) return sharedGraphemeSegmenter;
+	sharedGraphemeSegmenterResolved = true;
 	try {
 		const Segmenter = Intl.Segmenter;
 		if (typeof Segmenter === "function") {
-			const segments = new Segmenter(undefined, { granularity: "grapheme" }).segment(value);
-			return {
-				*[Symbol.iterator]() {
-					for (const part of segments) yield part.segment;
-				},
-			};
+			sharedGraphemeSegmenter = new Segmenter(undefined, { granularity: "grapheme" });
 		}
 	} catch {
-		// Without Intl.Segmenter, treat the complete value as one conservative grapheme.
+		sharedGraphemeSegmenter = undefined;
 	}
+	return sharedGraphemeSegmenter;
+}
+
+function segmentGraphemes(value: string): Iterable<string> {
+	const segmenter = getSharedGraphemeSegmenter();
+	if (segmenter !== undefined) {
+		const segments = segmenter.segment(value);
+		return {
+			*[Symbol.iterator]() {
+				for (const part of segments) yield part.segment;
+			},
+		};
+	}
+	// Without Intl.Segmenter, treat the complete value as one conservative grapheme.
 	return [value];
 }
 
@@ -763,6 +779,8 @@ function renderWorkingLineSchedule(
 	const frameStates: WorkingLineFrameState[] = [];
 	let codeUnits = 0;
 	const scheduleOrigin = definition.stateAt(scheduleStartFrame);
+	// `row` is invariant across the whole schedule; segment it once instead of per frame.
+	const rowCells = graphemeCells(row).cells;
 	for (let index = 0; index < definition.frameCount; index += 1) {
 		const scheduled = definition.stateAt(scheduleStartFrame + index);
 		const state = {
@@ -788,7 +806,7 @@ function renderWorkingLineSchedule(
 					theme,
 					config,
 					colors,
-					graphemeCells(row).cells,
+					rowCells,
 					width,
 					state.textTick,
 					config.textAnimation,
