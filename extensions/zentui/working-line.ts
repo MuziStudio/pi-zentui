@@ -40,6 +40,8 @@ export const MAX_WORKING_LINE_NORMALIZED_CODE_UNITS = 256;
 export const MAX_WORKING_LINE_STYLE_TOKENS = 4;
 export const MAX_WORKING_LINE_STYLE_CODE_UNITS = 48;
 export const MAX_WORKING_LINE_ENTRIES_EXAMINED = 256;
+/** Minimum interval between metric-only Loader replacements while an assistant streams. */
+export const WORKING_LINE_METRIC_UPDATE_INTERVAL_MS = 50;
 
 const WORKING_LINE_FALLBACKS: Record<"low" | "mid" | "high", SourceStyleFallback> = {
 	low: { theme: "dim", terminal: "bright-black" },
@@ -66,6 +68,16 @@ type WorkingLineContext = {
 };
 
 type AgentDurationListener = (durationMs: number) => void;
+
+export type WorkingLineMetricScheduler = {
+	setTimeout(callback: () => void, delayMs: number): unknown;
+	clearTimeout(handle: unknown): void;
+};
+
+const defaultMetricScheduler: WorkingLineMetricScheduler = {
+	setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+	clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
 
 /** One agent-duration clock shared by minimalist Editor and Working-line consumers. */
 export class AgentDurationClock {
@@ -1094,6 +1106,11 @@ export class WorkingLineController {
 	private elapsedUpdatesContext: WorkingLineContext | undefined;
 	private elapsedUpdatesGeneration = 0;
 	private stopElapsedUpdates: (() => void) | undefined;
+	private lastMetricWriteAt: number | undefined;
+	private metricUpdateScheduled = false;
+	private metricUpdateHandle: unknown;
+	private metricUpdateContext: WorkingLineContext | undefined;
+	private metricUpdateGeneration = 0;
 
 	constructor(
 		private readonly getConfig: () => ZentuiConfig,
@@ -1103,6 +1120,7 @@ export class WorkingLineController {
 		private readonly now: () => number = Date.now,
 		private readonly getThought: () => WorkingLineRuntimeSegments["thought"] = () => this.thought,
 		private readonly onUnavailable: () => void = () => {},
+		private readonly metricScheduler: WorkingLineMetricScheduler = defaultMetricScheduler,
 	) {}
 
 	startSession(ctx: WorkingLineContext): WorkingLineReconcileResult {
@@ -1125,6 +1143,7 @@ export class WorkingLineController {
 	}
 
 	startTurn(ctx: WorkingLineContext): WorkingLineReconcileResult {
+		this.lastMetricWriteAt = undefined;
 		const config = this.getConfig().components.workingLine;
 		this.activeTools.clear();
 		const selectedMessage = selectWorkingLineMessage(config, this.random);
@@ -1142,12 +1161,15 @@ export class WorkingLineController {
 	): void {
 		this.tokens = tokens;
 		this.thought = thought;
-		this.updateIndicator(ctx);
+		this.scheduleMetricIndicator(ctx);
 		this.reconcileElapsedUpdates(ctx);
 	}
 
 	updateTokens(tokens: WorkingLineRuntimeSegments["tokens"], ctx: WorkingLineContext): void {
-		this.updateMetrics(tokens, this.getThought(), ctx);
+		this.tokens = tokens;
+		this.thought = this.getThought();
+		this.updateIndicator(ctx);
+		this.reconcileElapsedUpdates(ctx);
 	}
 
 	updateExtensionSegments(segments: readonly string[], ctx: WorkingLineContext): boolean {
@@ -1186,7 +1208,7 @@ export class WorkingLineController {
 		this.updateIndicator(ctx);
 	}
 
-	settle(
+	flushMetrics(
 		tokens: WorkingLineRuntimeSegments["tokens"],
 		thought: WorkingLineRuntimeSegments["thought"],
 		ctx: WorkingLineContext,
@@ -1195,6 +1217,14 @@ export class WorkingLineController {
 		this.thought = thought;
 		this.updateIndicator(ctx);
 		this.reconcileElapsedUpdates(ctx);
+	}
+
+	settle(
+		tokens: WorkingLineRuntimeSegments["tokens"],
+		thought: WorkingLineRuntimeSegments["thought"],
+		ctx: WorkingLineContext,
+	): void {
+		this.flushMetrics(tokens, thought, ctx);
 	}
 
 	reconcile(ctx: WorkingLineContext): WorkingLineReconcileResult {
@@ -1238,6 +1268,7 @@ export class WorkingLineController {
 		rebasePhase = false,
 		selectedMessage?: string,
 	): WorkingLineReconcileResult {
+		this.cancelMetricIndicator();
 		const ui = workingLineUi(ctx);
 		if (!ui) {
 			this.installed = false;
@@ -1393,6 +1424,7 @@ export class WorkingLineController {
 	}
 
 	private updateIndicator(ctx: WorkingLineContext): boolean {
+		this.cancelMetricIndicator();
 		const rootConfig = this.getConfig();
 		if (!rootConfig.components.workingLine.enabled || !this.installed) return false;
 		const ui = workingLineUi(ctx);
@@ -1406,6 +1438,49 @@ export class WorkingLineController {
 			this.recoverOrReleaseAfterFailure(ui, snapshot);
 			return false;
 		}
+	}
+
+	private scheduleMetricIndicator(ctx: WorkingLineContext): void {
+		const config = this.getConfig().components.workingLine;
+		if (!config.enabled || !this.installed) return;
+		this.metricUpdateContext = ctx;
+		const sampledAt = this.now();
+		const elapsed =
+			this.lastMetricWriteAt === undefined
+				? Number.POSITIVE_INFINITY
+				: Math.max(0, sampledAt - this.lastMetricWriteAt);
+		if (elapsed >= WORKING_LINE_METRIC_UPDATE_INTERVAL_MS) {
+			this.updateIndicator(ctx);
+			this.lastMetricWriteAt = sampledAt;
+			return;
+		}
+		if (this.metricUpdateScheduled) return;
+		this.metricUpdateScheduled = true;
+		const generation = ++this.metricUpdateGeneration;
+		this.metricUpdateHandle = this.metricScheduler.setTimeout(
+			() => {
+				if (!this.metricUpdateScheduled || generation !== this.metricUpdateGeneration) return;
+				this.metricUpdateScheduled = false;
+				this.metricUpdateHandle = undefined;
+				const latest = this.metricUpdateContext;
+				this.metricUpdateContext = undefined;
+				if (latest) {
+					this.updateIndicator(latest);
+					this.lastMetricWriteAt = this.now();
+				}
+			},
+			Math.max(0, WORKING_LINE_METRIC_UPDATE_INTERVAL_MS - elapsed),
+		);
+	}
+
+	private cancelMetricIndicator(): void {
+		this.metricUpdateContext = undefined;
+		this.metricUpdateGeneration++;
+		if (this.metricUpdateScheduled) {
+			this.metricScheduler.clearTimeout(this.metricUpdateHandle);
+		}
+		this.metricUpdateScheduled = false;
+		this.metricUpdateHandle = undefined;
 	}
 
 	private reconcileElapsedUpdates(ctx: WorkingLineContext): void {
@@ -1516,6 +1591,7 @@ export class WorkingLineController {
 	}
 
 	private reset(ctx: WorkingLineContext): void {
+		this.cancelMetricIndicator();
 		this.deactivateElapsedUpdates();
 		if (!this.ownsIndicator && !this.ownsMessage) return;
 		const ui = workingLineUi(ctx);
@@ -1542,6 +1618,8 @@ export class WorkingLineController {
 	}
 
 	private clearRuntime(): void {
+		this.cancelMetricIndicator();
+		this.lastMetricWriteAt = undefined;
 		this.deactivateElapsedUpdates();
 		this.agentActive = false;
 		this.activeTools.clear();
